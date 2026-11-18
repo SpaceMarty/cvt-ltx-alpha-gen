@@ -70,6 +70,7 @@ function Build([string]$dir, [string]$devFlag) {
     "-DLTXAG_VERSION=$($portVersion.Substring(3))" "-DWORKER_TEST_PYTHON=$($testPython -replace '\\', '/')" | Out-Null
   if ($LASTEXITCODE -ne 0) { throw 'cmake could not configure the build (is Visual Studio with the C++ tools installed?)' }
   & cmake --build $dir --config Release -j 2>&1 | Select-String -Pattern 'error|warning C' | ForEach-Object { $_.Line }
+  if ($LASTEXITCODE -ne 0) { throw "cmake build FAILED (exit code $LASTEXITCODE)" }
   if (-not (Test-Path (Join-Path $dir 'LTXAlphaGen.ofx.bundle\Contents\Win64\LTXAlphaGen.ofx'))) { throw 'build FAILED' }
   Add-Uv (Join-Path $dir 'LTXAlphaGen.ofx.bundle')
 }
