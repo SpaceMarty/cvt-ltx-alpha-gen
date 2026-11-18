@@ -1,5 +1,6 @@
 // Plain-assert tests for roi; run via ctest.
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
