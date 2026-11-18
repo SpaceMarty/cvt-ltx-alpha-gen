@@ -45,6 +45,13 @@
 // fp8, offload cpu, 2026-11-11), peak reserved against this estimate: HD 33f 11.1 GB (11.9),
 // HD 17f 7.6 (9.6), 768x512 17f 5.5 (7.0). Cautious by 1-2 GB; bf16, offload disk and longer
 // chunks are not measured.
+// CVT port (cvt1.51, corrected in cvt1.52): without the audio branch (cvt1.50) every Apple Silicon
+// need above is 7.0 GB lower, the smallest drop measured (M5 Max, peak reserved, HD 73f: 50.2 ->
+// 38.3-39.1 GB, one first chunk 43.1 GB; 768x432 17f 40.4 -> 27.4 GB):
+//   need = max(43.1, 30.0 + 0.10 GB * Mpx * frames) + 1 GB; HD 33 -> 44.1, HD 73 -> 46.3,
+//   UHD 17 -> 45.2. The floor is the highest peak measured without audio (HD 33f took 42.9 GB in
+//   worker_smoke), so small clips are over-estimated (768x432 17f: 44.1 vs 27.4 GB). The M1 Ultra
+//   fit drops by the same 7.0 GB (not measured on an M1).
 #pragma once
 
 namespace ltxag {
@@ -65,7 +72,19 @@ constexpr double kMpsMaxMpxFrames = 170.0;
 
 // mps: 0 = CUDA, 1 (or true) = Apple Silicon with the M1 fit, 2 = the M5-and-newer fit,
 // 3 = an M1-class Mac on the fp16 copy (cvt1.28; the same fit as 2).
+// CVT port (cvt1.55): with the reference encoded in tiles, the M5-and-newer fit (mps 2, 3) is
+//   16-bit: 26.5 + 0.075 GB * Mpx * frames + 1 GB; HD 33 -> 32.7, HD 73 -> 38.9, HD 81 -> 40.2
+//   8-bit:  13.0 + 0.137 GB * Mpx * frames + 1 GB; HD 33 -> 23.4, HD 73 -> 34.9
+// from peak reserved memory on an M5 Max (vram_estimate.cpp); not measured on a smaller Mac or an M1.
+// cvt1.56: on Apple Silicon 16-bit is the full model again (audio branch included, as cvt1.49), whose
+// edges stay softer on soft pictures; the video-only model (cvt1.50-1.55) is Auto's middle step:
+//   16-bit full:       max(40.6, 36.8 + 0.086 GB * Mpx * frames) + 1 GB; HD 33 -> 43.7, HD 73 -> 50.9
+//   16-bit video-only: the cvt1.55 16-bit fit above
+// Weights (Apple Silicon only): Full16 the whole transformer in 16 bits; VideoOnly16 without its audio
+// branch (cvt1.50); Int8 (cvt1.53) 8-bit weights, always video-only.
+enum class Weights { Full16 = 0, VideoOnly16 = 1, Int8 = 2 };
 VramNeed estimateVramNeed(bool fp8, int width, int height, int framesInLargestChunk,
-                          bool residentTransformer, int mps = 0, bool streamed = false);
+                          bool residentTransformer, int mps = 0, Weights weights = Weights::Full16,
+                          bool streamed = false);  // Windows port: streamed
 
 }  // namespace ltxag

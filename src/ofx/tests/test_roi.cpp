@@ -78,6 +78,53 @@ int main() {
     std::fprintf(stderr, "%d failure(s)\n", failures);
     return 1;
   }
-  std::printf("test_roi: all checks passed\n");
-  return 0;
+  {  // cvt1.63: guideMask grows the alpha by `grow` px and feathers it
+    const int w = 200, h = 200;
+    std::vector<float> a(w * h, 0.0f), g;
+    for (int y = 90; y < 110; ++y)
+      for (int x = 90; x < 110; ++x) a[y * w + x] = 0.8f;  // a 20 px square, soft value over 0.5
+    guideMask(a.data(), w, h, 20.0f, 10.0f, g);
+    auto at = [&](int x, int y) { return g[y * w + x]; };
+    CHECK(at(100, 100) > 0.99f, "guide centre %f", at(100, 100));
+    CHECK(at(120, 100) > 0.7f, "guide 10 px outside the square %f", at(120, 100));
+    CHECK(at(129, 100) > 0.3f && at(129, 100) < 0.7f, "guide at the grown edge %f", at(129, 100));
+    CHECK(at(160, 100) < 0.01f, "guide far outside %f", at(160, 100));
+    std::vector<float> z(w * h, 0.3f);  // nothing at or above 0.5: an empty guide
+    guideMask(z.data(), w, h, 20.0f, 10.0f, g);
+    float mx = 0;
+    for (float v : g) mx = std::max(mx, v);
+    CHECK(mx == 0.0f, "guide from an alpha below 0.5 is not empty: %f", mx);
+  }
+  {  // cvt1.65: upscaleInt keeps flat areas, and a k x k mean of the result gives the input back closely
+    const int w = 40, h = 30, k = 3;
+    std::vector<float> in(w * h * 2), up;
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        in[(y * w + x) * 2] = 0.25f;
+        in[(y * w + x) * 2 + 1] = (x / 10 + y / 10) % 2 ? 0.9f : 0.1f;  // blocks
+      }
+    upscaleInt(in.data(), w, h, 2, k, up);
+    CHECK(up.size() == size_t(w * k * h * k * 2), "upscale size");
+    double worstFlat = 0, worstBack = 0;
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        double m = 0;
+        for (int dy = 0; dy < k; ++dy)
+          for (int dx = 0; dx < k; ++dx) {
+            const size_t o = (size_t(y * k + dy) * w * k + x * k + dx) * 2;
+            worstFlat = std::max(worstFlat, double(std::fabs(up[o] - 0.25f)));
+            m += up[o + 1];
+          }
+        m /= k * k;
+        if (x % 10 > 1 && x % 10 < 8 && y % 10 > 1 && y % 10 < 8)  // away from block edges
+          worstBack = std::max(worstBack, std::fabs(m - in[(y * w + x) * 2 + 1]));
+      }
+    CHECK(worstFlat < 1e-5, "upscale changed a flat channel: %f", worstFlat);
+    CHECK(worstBack < 1e-3, "k x k mean of the upscale is not the input: %f", worstBack);
+    CHECK(cropScaleFor(3, 640, 360, kCropScaleMaxPixels) == 3, "640x360 at 3x fits HD");
+    CHECK(cropScaleFor(3, 700, 450, kCropScaleMaxPixels) == 2, "700x450 steps down to 2x");
+    CHECK(cropScaleFor(3, 1600, 900, kCropScaleMaxPixels) == 1, "1600x900 is not scaled");
+  }
+  if (failures == 0) std::printf("test_roi: all checks passed\n");  // cvt1.63: failures now fail the test
+  return failures == 0 ? 0 : 1;
 }

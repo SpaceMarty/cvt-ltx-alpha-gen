@@ -13,6 +13,8 @@ Manifest fields: job_id node_id input width height frames chunks[[start,len]] fr
 contrib[[[chunk,weight],...]] cache_root worker [worker_python] [worker_args[]] seconds simulate
 precision title. ROI (decision 63): width/height are then the CROP staged in `input`, plus
 full_width full_height roi[x0,y0,w,h] (top-down); results are pasted into black full frames.
+crop_scale (cvt1.65): the crop was staged k times larger (width/height are then k times the roi
+box); each matte is averaged back down over k x k blocks before it is pasted.
 Merge (decision 62): merge "smooth" blends overlaps by the weights in contrib; "flow" warps the
 two mattes towards each other first (ltxag_worker/morph.py).
 Status file <cache_root>/jobs/<job_id>.json is rewritten after every chunk (state "running")
@@ -534,6 +536,7 @@ def main() -> int:
     log.node, log.job = m.get("node_id", "-"), job_id
     keys, contrib, chunks = m["frame_keys"], m["contrib"], m["chunks"]
     roi, merge = m.get("roi"), m.get("merge", "smooth")
+    scale = int(m.get("crop_scale", 1))  # cvt1.65
     staging = os.path.dirname(os.path.abspath(manifest_path))  # the plugin's stagingDir()
     out_prefix = os.path.join(staging, f"ltxag_job_{job_id}_out")
     pid_file = os.path.join(staging, f"ltxag_job_{job_id}.pid")
@@ -542,7 +545,7 @@ def main() -> int:
     cache.mark_pending(root, keys, os.getpid())
     t_start = time.time()
     log.info(f"start: {m['frames']} frames {m['width']}x{m['height']}, chunks={chunks}, "
-             f"merge={merge} roi={roi} holds={m.get('holds')} precision={m['precision']} simulate={m['simulate']} sim_seconds={m['seconds']} "
+             f"merge={merge} roi={roi} scale={scale}x holds={m.get('holds')} precision={m['precision']} simulate={m['simulate']} sim_seconds={m['seconds']} "
              f"python={sys.executable} {sys.version.split()[0]} ui={ui}")
     cache.write_status(root, job_id, "running", "", chunks_done=0, chunks=len(chunks),
                        frames_done=0, frames=len(keys))
@@ -613,6 +616,9 @@ def main() -> int:
                 matte = (1.0 - wb) * a + wb * b
         else:
             matte = sum(w * results[c][f - chunks[c][0]].astype(np.float32) for c, w in parts)
+        if scale > 1:  # cvt1.65: Crop Scale: the model saw the crop k times larger; a k x k mean undoes it
+            hh, ww = matte.shape
+            matte = matte.reshape(hh // scale, scale, ww // scale, scale).mean(axis=(1, 3))
         if roi:
             full = np.zeros((m["full_height"], m["full_width"]), np.float32)
             full[roi[1]:roi[1] + roi[3], roi[0]:roi[0] + roi[2]] = matte

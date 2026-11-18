@@ -54,14 +54,14 @@ StagingFile::StagingFile(const std::string& tag) {
 StagingFile::~StagingFile() { ::unlink(path_.c_str()); }
 
 bool FrameWriter::open(const std::string& path, uint32_t w, uint32_t h, uint32_t n,
-                       std::string& err) {
+                       std::string& err, uint32_t channels) {
   close();
   fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   if (fd_ < 0) {
     err = "cannot create " + path + ": " + std::strerror(errno);
     return false;
   }
-  frameBytes_ = size_t(w) * h * 3 * sizeof(uint16_t);
+  frameBytes_ = size_t(w) * h * channels * sizeof(uint16_t);  // cvt1.63: 3 or 4 channels
   const off_t total = off_t(sizeof(FrameFileHeader)) + off_t(frameBytes_) * n;
   const int rc = reserve(fd_, total);
   if (rc != 0) {
@@ -69,7 +69,7 @@ bool FrameWriter::open(const std::string& path, uint32_t w, uint32_t h, uint32_t
           " MB of frames: " + std::strerror(rc);
     return false;
   }
-  FrameFileHeader hdr{{'L', 'T', 'X', 'A'}, kTransportVersion, w, h, n, 3};
+  FrameFileHeader hdr{{'L', 'T', 'X', 'A'}, kTransportVersion, w, h, n, channels};
   if (!writeAll(fd_, &hdr, sizeof hdr)) {
     err = std::string("header write failed: ") + std::strerror(errno);
     return false;

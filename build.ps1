@@ -30,7 +30,7 @@ $devBuild = Join-Path $here 'build-dev'
 $cvt = Join-Path $env:USERPROFILE '.cvt'
 $testPy = Join-Path $cvt 'ltx-alphagen-testpy'
 $testPython = Join-Path $testPy 'Scripts\python.exe'
-$portVersion = 'cvt1.50'   # the version: Version label, and (as 1.50) the plugin version hosts store
+$portVersion = 'cvt1.65'   # the version: Version label, and (as 1.65) the plugin version hosts store
 
 if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) { throw 'cmake is missing: install it from cmake.org (or: winget install Kitware.CMake)' }
 

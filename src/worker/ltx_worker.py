@@ -3,8 +3,8 @@
 Three modes:
   one-shot (job.py legacy / smoke tests):
       --in F --chunks s:l,... --out-prefix P --model-dir M --embeddings E
-      [--precision bf16|fp8|fp16] [--offload none|cpu|disk] [--colour Auto|<colour.SOURCES key>]
-      [--colour-tag T] [--ocio-config C] [--hold K | --holds K,K,..]
+      [--precision bf16|fp8|fp16|int8|bf16-video|fp16-video] [--offload none|cpu|disk]
+      [--colour Auto|<colour.SOURCES key>] [--colour-tag T] [--ocio-config C] [--hold K | --holds K,K,..]
       stdout lines as in dummy_worker.py: info / progress / chunk_done / done / error
   serve (resident worker, decisions 11/19/33):
       --serve SOCKET --model-dir M --embeddings E --precision P [--offload O] [--flame-pid N]
@@ -31,6 +31,11 @@ LoRA 1.0. Injections into the pinned LTX-2 code (commit 9ec55f9):
     (upstream "builds on each call, frees on exit": 6.6 s per chunk at HD fp8). Safe because
     the single-GPU Builder.build ignores the per-call video_tools kwarg (ARG002);
   - pipeline.audio_decoder = None: video-only chunks (chunks/operators.py:285), saving ~2 s/chunk;
+  - CVT port (cvt1.50), injection 8: a video-only transformer (LTXVideoOnlyModelConfigurator, the
+    audio weights never read) and chunks without an audio latent, so the sound track LTX-2.5
+    denoises beside the picture is no longer computed (~12 GB less memory). cvt1.56: only for 8-bit
+    weights; 16-bit keeps the full model, whose edges stay softer where the picture is soft (motion
+    blur, focus). LTXAG_VIDEO_ONLY=1 forces it for 16-bit too, for A/B tests;
   - CVT port (cvt1.32), injection 7: helpers.activation_budget_bytes -> a fixed budget per Mac
     (DECODE_BUDGET_FRACTION of the Metal working set). The DiffVAE decode picks its tiles from the
     free memory at each chunk's decode (helpers.tiling_config_for_vae), and at HD the tile layout
@@ -70,10 +75,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import os
 import socket
 import subprocess
+import hashlib  # cvt1.58: input_fingerprint
 import sys
 import threading
 import time
@@ -112,7 +119,8 @@ class Accel:
         else:
             raise RuntimeError("no NVIDIA (CUDA) or Apple (MPS) GPU is available to the worker")
         self.device = torch.device(self.kind)
-        self.peak = [0.0, 0.0]  # MPS only: sampled allocated, reserved (torch.mps has no peak statistics)
+        self.peak = [0.0, 0.0]  # sampled allocated, reserved (torch.mps has no peak statistics)
+        self.phase_peak = [0.0, 0.0]  # cvt1.55: the same since the last reset_peaks_phase()
 
     def describe(self) -> str:
         t = self.torch
@@ -138,9 +146,12 @@ class Accel:
         return (t.mps.recommended_max_memory() - t.mps.driver_allocated_memory()) / 2**30
 
     def sample(self) -> float:
-        """Free memory now; on MPS also updates the sampled peaks."""
+        """Free memory now; on MPS also updates the sampled peaks (CUDA keeps its own). cvt1.55: and the
+        peaks of the current phase, on both."""
+        a, r = self.allocated_gb(), self.reserved_gb()
         if self.kind == "mps":
-            self.peak = [max(self.peak[0], self.allocated_gb()), max(self.peak[1], self.reserved_gb())]
+            self.peak = [max(self.peak[0], a), max(self.peak[1], r)]
+        self.phase_peak = [max(self.phase_peak[0], a), max(self.phase_peak[1], r)]
         return self.free_gb()
 
     def reset_peaks(self) -> None:
@@ -148,6 +159,10 @@ class Accel:
             self.torch.cuda.reset_peak_memory_stats()
         else:
             self.peak = [self.allocated_gb(), self.reserved_gb()]
+        self.phase_peak = [self.allocated_gb(), self.reserved_gb()]
+
+    def reset_peaks_phase(self) -> None:  # cvt1.55
+        self.phase_peak = [self.allocated_gb(), self.reserved_gb()]
 
     def peaks_gb(self) -> tuple[float, float]:
         t = self.torch
@@ -186,6 +201,13 @@ class MemoryFrameSource:
 # cvt1.32: LTXAG_HASH_STAGES=1 logs a fingerprint of each chunk's data after each stage (reference
 # latent, latent into the decoder, matte), to find where two runs of the same frames part ways.
 HASH_STAGES = os.environ.get("LTXAG_HASH_STAGES") == "1"
+# cvt1.50: the transformer without its audio branch (injection 8). cvt1.56: 8-bit weights only (the
+# full model keeps soft edges softer: on a motion-blurred HD shot it had twice the partly transparent
+# edge pixels, matching cvt1.49); LTXAG_VIDEO_ONLY=1 forces it for 16-bit, for A/B tests.
+VIDEO_ONLY_16BIT = os.environ.get("LTXAG_VIDEO_ONLY") == "1"
+# cvt1.53: precision "int8" (the node's Weights 8-bit, or Auto when 16-bit doesn't fit) stores the
+# transformer's big Linears in 8 bits (ltxag_worker/int8.py). LTXAG_WEIGHTS=int8 forces it, for tests.
+INT8_WEIGHTS = os.environ.get("LTXAG_WEIGHTS") == "int8"
 _stage_hashes: list[str] = []
 
 
@@ -196,6 +218,19 @@ def _hash_stage(name: str, t) -> None:  # noqa: ANN001 - a torch tensor
         _stage_hashes.append(f"{name} {hashlib.sha1(t.detach().float().cpu().numpy().tobytes()).hexdigest()[:12]}")
 
 
+# cvt1.55: the reference is encoded in overlapping spatial tiles of ENCODE_TILE px (upstream's
+# VideoEncoder.tiled_encode, ENCODE_OVERLAP px blended), still in fp32. At HD 65 frames the encode took
+# 24.4 GB allocated / 38.6 GB reserved in one piece, the job's peak; tiled 7.5 / 9.6 GB. Two runs give
+# identical mattes; against one piece 0.12% of pixels differ by more than 0.1. LTXAG_ENCODE_TILE=0: one
+# piece, as before. cvt1.57: tiles only for 16-bit video-only and 8-bit, where the encode was the peak; the
+# full model's peak is its load (HD 73f: 49.9 GB tiled, 50.2 in one piece in cvt1.49), so it encodes in one
+# piece and its mattes match cvt1.49's. LTXAG_ENCODE_TILE, when set, applies to every path (tests).
+ENCODE_TILE_SET = "LTXAG_ENCODE_TILE" in os.environ
+ENCODE_TILE = int(os.environ.get("LTXAG_ENCODE_TILE", "640"))
+ENCODE_OVERLAP = int(os.environ.get("LTXAG_ENCODE_OVERLAP", "128"))
+_after_encode = [lambda: None]  # cvt1.55: called when a chunk's reference encode is done (phase peaks)
+
+
 class ReferenceEncoderInDtype:
     """Stands in for ImageConditioner (blocks.py:948): builds the reference video encoder in
     another dtype and casts frames in / latents out, so the rest of the pipeline is unchanged.
@@ -204,6 +239,7 @@ class ReferenceEncoderInDtype:
     class _Cast:
         def __init__(self, enc, dtype, sync) -> None:  # noqa: ANN001
             self.enc, self.dtype, self.sync = enc, dtype, sync
+            self.tile = ENCODE_TILE  # cvt1.57: set per engine (ReferenceEncoderInDtype.tile)
 
         def __call__(self, video):  # noqa: ANN001
             import torch
@@ -211,8 +247,20 @@ class ReferenceEncoderInDtype:
             hooks = [m.register_forward_hook(lambda *_: self.sync())
                      for m in self.enc.modules() if self.sync and isinstance(m, torch.nn.Conv3d)]
             try:
-                out = self.enc(video.to(self.dtype)).to(video.dtype)
+                h, w = video.shape[-2], video.shape[-1]
+                tile = self.tile
+                if tile and max(h, w) > tile:  # cvt1.55
+                    from ltx_core.tiling import DimensionSizeConfig, TileSizeConfig
+
+                    def axis(n: int) -> DimensionSizeConfig:
+                        return DimensionSizeConfig(tile, ENCODE_OVERLAP) if n > tile else DimensionSizeConfig()
+
+                    out = self.enc.tiled_encode(video.to(self.dtype), TileSizeConfig(height=axis(h), width=axis(w)))
+                    out = out.to(video.dtype)
+                else:
+                    out = self.enc(video.to(self.dtype)).to(video.dtype)
                 _hash_stage("reference", out)
+                _after_encode[0]()
                 return out
             finally:
                 for h in hooks:
@@ -221,15 +269,20 @@ class ReferenceEncoderInDtype:
         def __getattr__(self, name: str):
             return getattr(self.enc, name)
 
-    def __init__(self, inner, dtype, sync=None) -> None:  # noqa: ANN001 - ImageConditioner, torch.dtype
+    def __init__(self, inner, dtype, sync=None, tile: int = ENCODE_TILE) -> None:  # noqa: ANN001
         inner._dtype = dtype  # the dtype its Builder builds the encoder in (blocks.py:998)
-        self.inner, self.dtype, self.sync = inner, dtype, sync
+        self.inner, self.dtype, self.sync, self.tile = inner, dtype, sync, tile
 
     def resolve_crf(self, images):  # noqa: ANN001
         return self.inner.resolve_crf(images)
 
     def __call__(self, fn):  # noqa: ANN001
-        return self.inner(lambda enc: fn(ReferenceEncoderInDtype._Cast(enc, self.dtype, self.sync)))
+        def run(enc):  # noqa: ANN001, ANN202
+            cast = ReferenceEncoderInDtype._Cast(enc, self.dtype, self.sync)
+            cast.tile = self.tile
+            return fn(cast)
+
+        return self.inner(run)
 
 
 def encode_dtype(torch):  # noqa: ANN001, ANN201 - the torch module
@@ -311,6 +364,43 @@ def build_embeddings(path: str, transformer: str, text_encoder: str, video_vae: 
     return 0
 
 
+def input_fingerprint(raw, start: int) -> str:  # noqa: ANN001 - (n,h,w,3) frames as the host staged them
+    """cvt1.58: a short fingerprint of the frames a job received, before any colour conversion, so two
+    renders of the same shot can be compared from their logs: one hash for the chunk, one per frame (6 hex
+    digits each, from clip frame `start` on), the mean and range of the values, and which bit depth the
+    values sit on (a host can hand over an 8-bit picture as floats). The model gives the same matte for the
+    same frames, so different mattes with the same settings mean different frames."""
+    a = np.ascontiguousarray(raw)
+    whole = hashlib.sha1(a.tobytes()).hexdigest()[:12]
+    per = " ".join(hashlib.sha1(a[i].tobytes()).hexdigest()[:6] for i in range(a.shape[0]))
+    sample = a[:, ::4, ::4, :].astype(np.float32)
+    levels = "float"
+    for bits in (8, 10, 12):  # values that are k / (2^bits - 1), as stored in the staging dtype
+        top = float(2 ** bits - 1)
+        if np.mean((np.round(sample * top) / top).astype(a.dtype).astype(np.float32) == sample) > 0.999:
+            levels = f"{bits}-bit"
+            break
+    mean = sample.reshape(-1, 3).mean(axis=0)
+    return (f"input {whole}, {levels} levels, mean RGB {mean[0]:.4f} {mean[1]:.4f} {mean[2]:.4f}, "
+            f"range {float(sample.min()):.4f}-{float(sample.max()):.4f}; frames from {start}: {per}")
+
+
+def _trim_after_build(torch, blocks) -> None:  # noqa: ANN001
+    """cvt1.53: hand the MPS cache back after each 8-bit transformer build (the bf16 scratch of the
+    conversion, ~20 GB otherwise)."""
+    if getattr(blocks.DiffusionStage, "_ltxag_trim", False):
+        return
+    build = blocks.DiffusionStage._build_transformer
+
+    def build_and_trim(stage, **kwargs):  # noqa: ANN001, ANN003
+        model = build(stage, **kwargs)
+        torch.mps.empty_cache()
+        return model
+
+    blocks.DiffusionStage._build_transformer = build_and_trim
+    blocks.DiffusionStage._ltxag_trim = True
+
+
 class Engine:
     """The loaded pipeline. One per process; serves any number of jobs."""
 
@@ -328,7 +418,10 @@ class Engine:
         self.accel = Accel(torch)
         self.model_dir, self.precision, self.offload = model_dir, precision, offload
         self.frames_on_gpu = frames_on_gpu  # A/B only: the pre-2026-10-11 behaviour
-        self.fp16 = precision == "fp16"  # decision 68
+        self.fp16 = precision.split("-")[0] == "fp16"  # decision 68
+        # cvt1.56: "bf16-video"/"fp16-video": 16-bit without the audio branch (Auto's middle step)
+        self.video_only = precision.endswith("-video") or VIDEO_ONLY_16BIT
+        self.int8 = precision == "int8" or INT8_WEIGHTS  # cvt1.53: from the bf16 file, bf16 activations
         t0 = time.time()
         emit("info", self.accel.describe())
         paths = model_paths_for(model_dir)
@@ -359,6 +452,12 @@ class Engine:
             spatial_upsampler_path=paths["upsampler"],
             loras=[LoraPathStrengthAndSDOps(paths["lora"], 1.0, LTXV_LORA_COMFY_RENAMING_MAP)],
             quantization=quant, offload_mode=OffloadMode(offload))
+        if self.int8 and self.fp16:  # cvt1.53: only on the video-only bf16 path
+            raise RuntimeError("8-bit weights need bf16 activations")
+        if (self.int8 or self.video_only) and offload != "none":  # Windows port: _make_video_only builds
+            raise RuntimeError("8-bit and video-only weights are not supported with offload")  # its own stage
+        if self.int8 or self.video_only:  # injection 8 (cvt1.50; cvt1.56: 8-bit or "-video" only)
+            self._make_video_only(ic_lora, transformer_file, emit)
         if self.fp16:
             self.pipeline.dtype = torch.float16  # latents, noise and reference frames (ic_lora.py:312)
             self.pipeline._diffusion_stage._dtype = torch.float16  # the denoising state (blocks.py:565)
@@ -368,13 +467,31 @@ class Engine:
         self.pipeline.audio_decoder = None  # injection 4: video-only output
         if self.accel.kind == "mps":  # injection 6: reference encode in fp32 (cvt1.32: always)
             enc_dtype = encode_dtype(torch)
-            emit("info", f"reference encode in {str(enc_dtype).removeprefix('torch.')}")
+            # cvt1.57: tiled only where the encode was the peak (8-bit, 16-bit video-only)
+            tile = ENCODE_TILE if (ENCODE_TILE_SET or self.int8 or self.video_only) else 0
+            emit("info", f"reference encode in {str(enc_dtype).removeprefix('torch.')}"
+                         f"{f', {tile} px tiles' if tile else ', in one piece'}")
             self.pipeline.image_conditioner = ReferenceEncoderInDtype(self.pipeline.image_conditioner, enc_dtype,
-                                                                      sync=torch.mps.synchronize)
+                                                                      sync=torch.mps.synchronize, tile=tile)
         self._on_step = lambda k, n: None
         self._install_step_hook()  # injection 5
-        if self.accel.kind == "mps":  # (the budget is a share of Metal's working set)
+        if self.accel.kind == "mps":  # (the budget is a share of Metal's working set; Windows port)
             self._fix_decode_budget(emit)  # injection 7 (cvt1.32)
+        class TrimmingDecoder:  # cvt1.55: hand the MPS cache back before the decode
+            # The transformer is gone by then (rebuilt per chunk) or idle, but its scratch stays
+            # reserved: in 8-bit the decode allocated 12.1 GB and held 28.7.
+            def __init__(self, inner, torch) -> None:  # noqa: ANN001
+                self.inner, self.torch = inner, torch
+
+            def __call__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+                self.torch.mps.empty_cache()
+                return self.inner(*args, **kwargs)
+
+            def __getattr__(self, name: str):
+                return getattr(self.inner, name)
+
+        if self.accel.kind == "mps":
+            self.pipeline.video_decoder = TrimmingDecoder(self.pipeline.video_decoder, torch)
         if HASH_STAGES:  # cvt1.32: the latent going into the decoder
             class HashingDecoder:
                 def __init__(self, inner) -> None:  # noqa: ANN001
@@ -417,6 +534,44 @@ class Engine:
         self.accel.empty_cache()
         emit("info", f"engine ready in {time.time() - t0:.1f} s (precision {precision}, offload {offload}, "
                      f"transformer {'resident' if keep_transformer else 'rebuilt per chunk'})")
+
+    def _make_video_only(self, ic_lora, transformer_file: str, emit) -> None:  # noqa: ANN001
+        """cvt1.50, injection 8: the transformer without its audio branch. LTX-2.5 denoises a sound
+        track alongside the picture (audio blocks plus audio<->video cross-attention, ~12 GB of the
+        42 GB bf16 file); the matte never uses it. Upstream's LTXVideoOnlyModelConfigurator builds
+        the video half, an SDOps limited to its keys keeps the audio weights from ever being read
+        from disk, and chunks carry no audio latent (chunks/operators.py: audio=None -> no audio
+        modality). cvt1.56: used for 8-bit weights only (LTXAG_VIDEO_ONLY=1: for 16-bit too)."""
+        import torch
+
+        from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
+        from ltx_core.model.transformer import LTXV_MODEL_COMFY_RENAMING_MAP, LTXVideoOnlyModelConfigurator
+        from ltx_pipelines.utils import blocks
+
+        with torch.device("meta"):
+            shell = LTXVideoOnlyModelConfigurator.from_metadata(SafetensorsModelStateDictLoader().metadata(transformer_file))
+        keys = frozenset(shell.state_dict().keys())
+        del shell
+        sd_ops, quant = LTXV_MODEL_COMFY_RENAMING_MAP.with_additional_allowed_keys(keys), None
+        if self.int8:  # cvt1.53
+            from ltxag_worker import int8
+
+            sd_ops, quant = int8.add_quantize_ops(sd_ops), int8.policy()
+            emit("info", "transformer weights in 8 bits (int8, per-row scales)")
+            _trim_after_build(torch, blocks)  # the bf16 scratch of the conversion (~20 GB otherwise)
+        self.pipeline._diffusion_stage = blocks.DiffusionStage.from_checkpoint(
+            transformer_file, self.pipeline.dtype, self.pipeline.device,
+            model_configurator=LTXVideoOnlyModelConfigurator, model_sd_ops=sd_ops, quantization=quant)
+        if not getattr(ic_lora, "_ltxag_video_only", False):
+            original = ic_lora.generate_uniform_chunks
+
+            def video_chunks(*args, **kwargs):  # noqa: ANN002, ANN003
+                for chunk in original(*args, **kwargs):
+                    yield dataclasses.replace(chunk, audio=None, audio_context=None)
+
+            ic_lora.generate_uniform_chunks = video_chunks
+            ic_lora._ltxag_video_only = True
+        emit("info", f"video-only transformer ({len(keys)} tensors; the audio branch is not loaded)")
 
     def _fix_decode_budget(self, emit) -> None:
         """cvt1.32: decode tiles from a fixed budget, so a clip's mattes repeat between runs."""
@@ -519,13 +674,28 @@ class Engine:
             accel.reset_peaks()
             alloc_start = accel.allocated_gb()
             emit("stage", i, "converting" if conv.active else "preparing")
-            frames = conv.apply(transport.read_frames_range(args_safe(inp), start, length))  # (n,h,w,3) f32
+            raw = transport.read_frames_range(args_safe(inp), start, length)
+            # cvt1.63: a 4th channel is the guide mask (Guide With Alpha: the input alpha, grown and
+            # feathered by the plugin), which steers the model's attention to that subject.
+            guide = raw[..., 3].astype(np.float32) if raw.shape[-1] == 4 else None
+            raw = raw[..., :3]
+            emit("info", f"{label}: " + input_fingerprint(raw, start))  # cvt1.58
+            frames = conv.apply(raw)  # (n,h,w,3) f32
             n, h, w, _ = frames.shape
             if hold > 1:  # decision 74: frame 0 once, then each frame `hold` times
                 frames = frames[padding.hold_indices(n, hold)]
+                if guide is not None:
+                    guide = guide[padding.hold_indices(n, hold)]
             padded, (top, left) = padding.pad_spatial(frames)
             padded = padding.pad_temporal(padded)
             np_, hp, wp = padded.shape[0], padded.shape[1], padded.shape[2]
+            guide_t = None
+            if guide is not None:
+                g, _ = padding.pad_spatial(guide[..., None])
+                g = padding.pad_temporal(g)[..., 0]
+                guide_t = torch.from_numpy(np.ascontiguousarray(g))[None, None].to(accel.device, torch.float32)
+                emit("info", f"{label}: guided by the input alpha (mask covers {float(guide_t.mean()) * 100:.1f}% "
+                             f"of the frame)")
             frames_t = torch.from_numpy(np.ascontiguousarray(padded))
             if self.frames_on_gpu:
                 frames_t = frames_t.to(accel.device)
@@ -534,9 +704,21 @@ class Engine:
                          f"(input ready in {time.time() - t0:.1f} s)")
             emit("stage", i, "denoising")
 
+            phase_peaks: list[str] = []  # cvt1.55: peak reserved per phase, to see which phase sets the chunk's peak
+
+            def phase_done(name: str) -> None:  # "name allocated/reserved" peaks in GB
+                phase_peaks.append(f"{name} {max(accel.phase_peak[0], accel.allocated_gb()):.1f}/"
+                                   f"{max(accel.phase_peak[1], accel.reserved_gb()):.1f}")
+                accel.reset_peaks_phase()
+
+            _after_encode[0] = lambda: phase_done("encode")
+
             def on_step(k: int, steps: int, i: int = i) -> None:
                 emit("step", i, k, steps)
+                if k == 1:
+                    phase_done("load+step 1")
                 if k == steps:
+                    phase_done(f"steps 2-{steps}")
                     emit("stage", i, "decoding")
 
             self._on_step = on_step
@@ -546,7 +728,8 @@ class Engine:
                 decoded, _, _ = self.pipeline.stream_chunks(
                     prompt="", seed=seed, height=hp * 2, width=wp * 2, num_frames=np_, frame_rate=FRAME_RATE,
                     images=[], video_conditioning=[(MEMORY_REF, 1.0)], skip_stage_2=True,
-                    vae_dtype=torch.bfloat16 if self.fp16 else None)
+                    vae_dtype=torch.bfloat16 if self.fp16 else None,
+                    conditioning_attention_mask=guide_t)  # cvt1.63: None = unguided, as before
                 video = torch.cat([c.video.to("cpu") for c in decoded], dim=0)  # (F,H,W,C) bf16 in [0,1]
             MemoryFrameSource.frames = None
             v = video.float()
@@ -558,6 +741,9 @@ class Engine:
             if hold > 1:
                 matte = matte[padding.held_output_indices(n, hold)]
             transport.write_mattes(f"{out_prefix}_{i}.bin", padding.crop(matte, n, top, left, h, w))
+            phase_done("decode")
+            _after_encode[0] = lambda: None
+            emit("info", f"{label}: peak allocated/reserved by phase (GB): " + ", ".join(phase_peaks))
             peak_a, peak_r = accel.peaks_gb()
             self.job_peak = [max(self.job_peak[0], peak_a), max(self.job_peak[1], peak_r)]
             emit("info", f"{label}: done in {time.time() - t0:.1f} s, allocated at start {alloc_start:.1f} GB, "
@@ -777,7 +963,8 @@ def main() -> int:
     ap.add_argument("--out-prefix", default=None)
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--embeddings", required=True)
-    ap.add_argument("--precision", default="bf16", choices=["bf16", "fp8", "fp16"])
+    ap.add_argument("--precision", default="bf16",  # cvt1.53: int8; cvt1.56: -video; Windows port: fp8
+                    choices=["bf16", "fp8", "fp16", "int8", "bf16-video", "fp16-video"])
     ap.add_argument("--offload", default="none", choices=["none", "cpu", "disk"],
                     help="where the transformer's weights are kept (LTX-2 OffloadMode)")
     ap.add_argument("--colour", default="Bypass", choices=[colour.AUTO] + list(colour.SOURCES))

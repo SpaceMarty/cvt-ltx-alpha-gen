@@ -393,3 +393,115 @@ unchanged; what Windows needs is added beside them. Code changes are marked `Win
 - cvt1.50: Windows (x64, NVIDIA): see "Windows" above. New Model Loading choice (hidden on a Mac). Also for the Mac: a Process
   with no cache folder yet (deleted, or a new Cache Folder typed in) makes it, where it used to end in MATTE MISSING because
   the thumbnails and pending markers could not be written.
+- cvt1.50: the transformer is loaded without its audio branch. LTX-2.5 makes a sound track beside the picture
+  (audio blocks and audio-video cross-attention, about 12 GB of the 42 GB model), and the matte never used it.
+  The worker now builds upstream's video-only model, never reads the audio weights from disk, and gives each
+  chunk no audio latent (injection 8). `LTXAG_KEEP_AUDIO=1` keeps the full model for A/B tests. The memory
+  estimate is unchanged until jobs on this version are measured.
+- cvt1.51: the memory check now matches cvt1.50, which no longer loads the audio part of the model. Every Apple
+  Silicon estimate is 11.3 GB lower, the smallest saving measured on the M5 Max (an HD 73-frame chunk peaked at
+  38.9 GB, down from 50.2 GB; it is now estimated at 42.0 GB, was 53.3). A 64 GB Mac, which gives the GPU about
+  52 GB, can now take HD shots in 73-frame chunks. Not measured on a 64 GB Mac or an M1 yet.
+- cvt1.52: corrects cvt1.51, which under-estimated one chunk. Its first HD 73-frame chunk peaked at 43.1 GB against an
+  estimate of 41.9 GB (the others took 38.3-39.1 GB). Every Apple Silicon estimate is now 7.0 GB lower than in cvt1.49
+  (not 11.3 GB), the smallest saving measured on any chunk, and never below 44.1 GB, the highest peak measured without
+  audio (43.1 GB) plus the margin, which looks like the model load. An HD 73-frame chunk is estimated at 46.3 GB, which still
+  fits the roughly 52 GB a 64 GB Mac gives the GPU. cvt1.51 was never committed.
+- cvt1.53: new Weights menu in Speed and Quality: Auto (default), 16-bit, 8-bit. 8-bit holds the transformer's
+  big layers (attention and feed-forward in every block) in 8 bits, one scale per row, converted while the
+  16-bit file loads, with the alpha-gen LoRA merged in first (`worker/ltxag_worker/int8.py`, worker precision
+  `int8`). In the test tool on the M5 Max it needed 12 GB less (HD 33 frames: 30.9 vs 42.9 GB), was about 2%
+  slower at HD, and its mattes were within 0.06% of 16-bit on average. Auto uses 16-bit when the clip fits at any chunk size
+  Chunk Size allows, else 8-bit; 8-bit mattes have their own cache entries (Auto shares the 16-bit ones). The
+  memory estimate is 11.5 GB lower for 8-bit. On an M1 it runs with bf16 activations (no fp16), slower there;
+  not tested on an M1 or a smaller Mac. Comps saved before load on Auto, which is 16-bit on any Mac where they ran.
+- cvt1.54: the 8-bit memory estimate is 8.5 GB below 16-bit, not 11.5 GB. cvt1.53's first 8-bit job in Resolve (HD,
+  65 frames in one chunk, 498 s) peaked at 34.3 GB against an estimate of 33.1 GB: in Resolve 8-bit saves about 9 GB,
+  not the 12 GB the test tool measured. HD 73-frame chunks are now estimated at 37.8 GB in 8-bit (46.3 in 16-bit).
+  The hints say about 8 GB less. cvt1.53 was never committed.
+- cvt1.55: the reference frames are encoded in overlapping 640 px tiles (upstream's tiled encode, 128 px blended,
+  still fp32). In one piece the encode was the job's peak: at HD 65 frames it took 24.4 GB and left the GPU cache at
+  38.6 GB, the same in 16-bit and 8-bit, so 8-bit saved nothing at the peak. Tiled it takes 7.5 GB. Two runs give
+  identical mattes; against the one-piece encode 0.12% of pixels differ by more than 0.1, and they match the test
+  shape as well. The MPS cache is also handed back before each decode, and the job log shows each chunk's peak per
+  phase (encode, load and step 1, steps, decode). The memory estimate for the M5 and newer is refit from eight runs
+  (peak reserved): 16-bit HD 73 frames 36.4 GB (was 43.1), estimated 38.9; 8-bit HD 73 frames 33.6 GB, estimated
+  34.9; 8-bit HD 33 frames 19.2 GB, estimated 23.4. `LTXAG_ENCODE_TILE=0` encodes in one piece, for tests only.
+  cvt1.54 was never committed.
+- cvt1.56: 16-bit runs the full model again (with its audio branch, as cvt1.49). On a motion-blurred HD shot the
+  video-only model (cvt1.50-1.55) drew about half as many partly transparent edge pixels: harder edges on the arm,
+  paddle and water where the picture is soft. Rendered four ways on the same 61 frames, the full model with the
+  one-piece encode matched the cvt1.49 matte (0.08% of pixels off by more than 0.1); the tiled encode only gives a
+  slightly different sample at the same softness, so it stays. Auto now tries the full model, then 16-bit without the
+  audio branch (precision "bf16-video"/"fp16-video", the old 1.55 path, about 13 GB less), then 8-bit (still
+  video-only). The explicit 16-bit choice is the full model. New M5 fit for it, from peak reserved memory: 768x432 17f
+  40.6, HD 33f 42.7, HD 65f 48.4, HD 73f 49.9 GB; need = max(40.6, 36.8 + 0.086 x Mpx x frames) + 1 GB. So a 64 GB
+  Mac (about 41 GB free) gets the video-only 16-bit at HD, which keeps the M1's speed: 8-bit on an M1 Max took 2595 s
+  against 1834 s for the same 33-frame HD chunk. `LTXAG_VIDEO_ONLY=1` forces video-only 16-bit, for A/B tests
+  (replaces `LTXAG_KEEP_AUDIO`). Cached 16-bit mattes made by cvt1.50-1.55 keep their key: clear them to remake.
+- cvt1.57: the full model (16-bit) encodes its reference frames in one piece again, as cvt1.49, so its mattes match
+  the public release; the tiled encode only gave a different sample (on a curly-hair shot 1.3% of pixels moved by
+  more than 0.1, the same softness). It saved nothing there: the full model's peak is its load (768x432 17f 40.4,
+  HD 33f 42.7, HD 73f 49.9 GB in one piece, the same as tiled). 16-bit video-only and 8-bit still tile, where the
+  encode was the peak. And Auto (Weights and Chunk Size) now plans with this Mac's size, not the free memory at
+  Process: the GPU working set less 5% and 8 GB for the host and system. A 64 GB M1 Max chose the full model with
+  46.6 GB free and video-only with 42.1, so one shot came out two ways; it now always gets 16-bit video-only (plan
+  41.2 GB: HD 73-frame chunks fit at 38.9), and an M5 Max with 128 GB always the full model. The memory check still
+  compares the job with what is free now, and its message says to close other apps. M1 Max, full model, HD 32
+  frames on cvt1.56: 43.0 GB peak against 43.7 estimated, 1999 s (video-only 1834 s, 8-bit 2595 s).
+- cvt1.58: each chunk's log line now carries a fingerprint of the frames the host staged, before any colour
+  conversion: a hash of the chunk and one per frame (6 hex digits), the mean RGB and range, and whether the values
+  sit on 8-, 10- or 12-bit levels. The model gives the same matte for the same frames (a node re-rendered on
+  2026-11-17 matched its 2026-11-07 matte to 0.001% of pixels; started at frame 1006 or 1029, 0.000%), yet two
+  LTX nodes with identical settings fed by the same Loader in one Fusion comp disagree by 1.8% of pixels, every
+  time. Re-rendering both and comparing the fingerprints shows which frames differ. About 0.3 s per HD 30-frame
+  chunk. No change to the mattes.
+- cvt1.59: new Output choice "Decontaminated + Matte Alpha" (added last, so saved setups keep theirs) and
+  "Decontaminate Erode (px)" (default 64). Contaminated edge pixels, where the background shows through hair,
+  motion blur and soft edges, get the subject's own colour: Blur-Fusion foreground estimation (Forte and Pitie,
+  ICIP 2021; radii 90 then 6 px at 1080p), clamped to the solid core's local mean +- 1.5 std, blended towards the
+  core colour pushed outwards (push-pull pyramid) where the matte is thin. Only pixels with matte between 0.02
+  and 0.98 and within the erode width of background change; the matte and the background stay as they are.
+  Render-time (ofx/src/decontam.cpp, own code; ideas from a GPL ComfyUI node, no code copied), in the colour space
+  the host delivers, about 0.25 s per HD frame. Post-Multiply Image applies to it as to Source.
+- cvt1.60: Decontaminated + Matte Alpha is now a strict edge extend: the solid core (matte >= 0.98), eroded by
+  "Alpha Erode" (renamed from "Decontaminate Erode"; now the erode of the core, default 2 px, param id alphaErode),
+  has its colour pushed outwards and that replaces every other subject pixel. 1.59's Blur-Fusion estimate kept
+  per-pixel source detail, so background lettering showed in the soft edge of an out-of-focus face (sh010), and
+  filled matte that reached past the visible edge with bright skin (a cut-out outline). Faint matte haze more
+  than 256 px (at 1080p) from the subject keeps the source, as does pure background. Thin hair strands now carry
+  the hair's smooth colour, not their own highlights. About 0.05 s per HD frame (was 0.25 s).
+- cvt1.61: "Edge Blend" (px, default 4, param id edgeBlend) under Alpha Erode: in Decontaminated + Matte Alpha,
+  the original picture fades into the extended edge colour over that many pixels, going in from where Alpha
+  Erode stops. The fade stays inside the solid part of the matte (>= 0.98), so no background detail returns;
+  the colour is now taken from beyond the blend. 0 is a hard switch (cvt1.60 had a fixed 1.5 px step).
+- cvt1.62: Edge Blend is shown as "Edge Fade" (same param id edgeBlend, so 1.61 setups keep their value), and new
+  "Edge Blur" (px, default 0 = off, param id edgeBlur): a blur of the decontaminated picture, the last step before
+  the matte, about a Gaussian of that size (three box passes). It averages only the subject's pixels (matte >= 0.02
+  near the subject), so the old background next to the edge never comes back, and it applies where the extended
+  colour does, tapering off with the fade so the picture further in stays sharp. About 0.14 s per HD frame at 4 px.
+- cvt1.63: "Guide With Alpha" (Guided ROI group, param id roiGuide; on for new nodes, off in setups saved before,
+  needs Process). The input alpha (Magic Mask, roto or a rough shape) is thresholded at 0.5, grown 20 px and
+  feathered (about a Gaussian of 10 px), both scaled with the frame height from 1080, and staged as a 4th channel
+  (frame file channels 4). The worker passes it as the IC-LoRA guide's conditioning_attention_mask (already in
+  ltx_pipelines; the ComfyUI Comfy Pro node's "v13" uses the same with SAM3), so LTX mattes that subject only and
+  still draws its edges. Tested on sh090 (33 HD frames): a mask on one woman cut the matte outside her by 99% with
+  hair as good; a rough moving box on a man LTX had ignored gave a clean full-body matte. Guided mattes get their
+  own cache key (ROI k bit 1). Also: test_roi now fails on a failed check.
+- cvt1.64: "Guide Grow (px)" (param id roiGuideGrow, default 20 at HD, 0-100, needs Process; non-default values
+  get their own cache key) and an optional "Occlusion Mask" input (clip "Occlusion", a mask clip in the Filter context
+  as openfx-misc's Mask inputs; not on Resolve's Color page). With Guide With Alpha, the occlusion mask is taken out of the
+  guide at Process (ROI k bit 2), and at render it cuts the matte where its own mask is solid (smooth 0.5-0.98),
+  so the soft edge between the subject and what is in front stays LTX's. For a subject passing behind someone (sh090:
+  guided by the cart man's Magic Mask, LTX also matted a strip of the old man in front). "Black Out Outside Alpha"
+  is hidden (Guide With Alpha does it better; still works in setups that have it on). Defaults halved: Alpha Erode
+  1 (was 2), Edge Fade 2 (was 4).
+- cvt1.65: "Crop Scale" (Off / 2x / 3x, Speed and Quality, param id cropScale, needs Process): with an input alpha,
+  the crop is scaled up by that whole factor (Catmull-Rom, the guide channel too) before the model sees it, and
+  job.py averages each matte back down over k x k blocks before pasting it into the frame. Memory, chunk size,
+  the 6K check and the job size use the scaled size; a crop that would end up bigger than about HD (1920x1088
+  pixels) is scaled less, logged. The scale is in the ROI state (bits 3-4) and so in the cache key. Tested
+  outside the node on sh470 (two people about 270 px tall, a 640x360 crop at 3x): the people separate, a
+  ponytail and hands survive, the curly hair is tighter, same time as an HD job. Labels renamed: Output
+  "Pixel Spread + Matte Alpha" (was Decontaminated + Matte Alpha), "Pixel Spread Erode / Fade / Blur" (were
+  Alpha Erode, Edge Fade, Edge Blur); param ids unchanged.

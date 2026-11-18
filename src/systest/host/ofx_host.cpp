@@ -686,7 +686,8 @@ Instance::Instance(Host& host, Effect& d, int w, int h, int frames, FrameSource 
     p.setDbl(kOfxImageEffectPropUnmappedFrameRange, 0, 0);
     p.setDbl(kOfxImageEffectPropUnmappedFrameRange, frames - 1, 1);
     p.setStr(kOfxImageClipPropFieldOrder, kOfxImageFieldNone);
-    p.setInt(kOfxImageClipPropConnected, 1);
+    // cvt1.64: an optional input (the Occlusion mask) is not connected, as in a real host.
+    p.setInt(kOfxImageClipPropConnected, p.getInt(kOfxImageClipPropOptional, 0, 0) ? 0 : 1);
     p.setInt(kOfxImageClipPropContinuousSamples, 0);
     effect_.clips[dc.first] = std::move(c);
   }

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <climits>
+#include <vector>
 
 namespace ltxag {
 
@@ -37,5 +38,20 @@ struct RoiBox {
 // bounds must be non-empty. Result lies inside [0,imgW) x [0,imgH); sides are multiples of 32
 // unless that would exceed the image.
 RoiBox expandRoi(const RoiBounds& bounds, int margin, int imgW, int imgH);
+
+// cvt1.63: the guide mask for the model (Guide With Alpha): the input alpha (w*h, rows in any
+// order) thresholded at 0.5, grown by `grow` px (round) and feathered (about a Gaussian of
+// `feather` px), as the subject mask that steers LTX's attention. A hard mask cuts hair; grown
+// and feathered, LTX's own edge decides the outline.
+constexpr float kGuideGrow = 20.0f, kGuideFeather = 10.0f;  // px at 1080p (scaled with the frame)
+void guideMask(const float* alpha, int w, int h, float grow, float feather, std::vector<float>& out);
+
+// cvt1.65: Crop Scale. The crop is scaled up by a whole factor k (Catmull-Rom, separable) so a
+// small subject covers more of the model's 32 px blocks; the matte comes back k times larger and
+// is averaged back down over k x k blocks (job.py). in: w*h*ch floats, rows in any order.
+void upscaleInt(const float* in, int w, int h, int ch, int k, std::vector<float>& out);
+// The largest factor <= want for which the scaled crop stays within maxPixels (at least 1).
+int cropScaleFor(int want, int w, int h, double maxPixels);
+constexpr double kCropScaleMaxPixels = 1920.0 * 1088.0;  // about HD: a scaled crop is never bigger
 
 }  // namespace ltxag

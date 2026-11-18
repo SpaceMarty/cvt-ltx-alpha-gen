@@ -107,7 +107,8 @@ else()
 endif()
 
 # Pure logic, shared with the unit tests.
-add_library(ltxag_core STATIC ofx/src/chunk_plan.cpp ofx/src/vram_estimate.cpp ofx/src/roi.cpp ofx/src/motion.cpp)
+add_library(ltxag_core STATIC ofx/src/chunk_plan.cpp ofx/src/vram_estimate.cpp ofx/src/roi.cpp ofx/src/motion.cpp
+  ofx/src/decontam.cpp)  # decontam: cvt1.59
 target_include_directories(ltxag_core PUBLIC ofx/src)
 
 add_library(${BUNDLE_NAME} MODULE
@@ -238,6 +239,10 @@ add_test(NAME vram_estimate COMMAND test_vram_estimate)
 add_executable(test_motion ofx/tests/test_motion.cpp)
 target_link_libraries(test_motion PRIVATE ltxag_core)
 add_test(NAME motion COMMAND test_motion)
+
+add_executable(test_decontam ofx/tests/test_decontam.cpp)  # cvt1.59
+target_link_libraries(test_decontam PRIVATE ltxag_core)
+add_test(NAME decontam COMMAND test_decontam)
 
 # System test host (systest/README.md): loads the bundle like Flame and runs end-to-end
 # scenarios. Not a ctest: it needs the isolated HOME and fake windows of systest/run_systest.sh.
